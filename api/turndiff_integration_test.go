@@ -5,6 +5,7 @@ package api
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -24,7 +25,8 @@ import (
 )
 
 // diffEnv starts an API whose turns run a shell that edits its folder by
-// prompt: edit1 and edit2 change files, hold writes its environment to
+// prompt: edit1 and edit2 change files, nested changes a file inside the
+// folder's nested repo app/, hold writes its environment to
 // <dir>/env-hold and waits for <dir>/release-hold. Every turn prints a
 // resume id, so the session continues.
 func diffEnv(t *testing.T, perm string) (*env, string) {
@@ -34,6 +36,7 @@ func diffEnv(t *testing.T, perm string) (*env, string) {
 		`case "$p" in ` +
 		`edit1) printf 'one\nTWO\n' > a.txt; echo new > b.txt; rm -f gone.txt;; ` +
 		`edit2) printf 'one\nthree\n' > a.txt;; ` +
+		`nested) printf 'm2\n' > app/main.go;; ` +
 		`hold) env > "$D/env-hold.tmp"; mv "$D/env-hold.tmp" "$D/env-hold"; ` +
 		`i=0; while [ ! -e "$D/release-hold" ] && [ $i -lt 1500 ]; do sleep 0.02; i=$((i+1)); done;; ` +
 		`esac`
@@ -152,6 +155,44 @@ func TestWorkspaceApplyRoute(t *testing.T) {
 	dws := wsOfTurn(t, e, direct.Turn)
 	if code, out := as(t, e, token, "POST", "/api/v0/workspaces/"+dws+"/apply", "{}"); code != 400 || !strings.Contains(out, "folder as it is") {
 		t.Fatalf("direct workspace apply: %d %s, want 400", code, out)
+	}
+}
+
+// A turn's edit inside a nested git repo of the folder (a repo of the
+// person's, a submodule) is in the workspace's changes, and an apply writes it
+// into the person's folder; the nested repo's own .git is left as it was.
+// 0.6.4 recorded such a repo by its commit only, so the edit never reached
+// the changes and the apply reported nothing to do.
+func TestWorkspaceApplyInsideNestedRepo(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("no git on PATH")
+	}
+	e, _ := diffEnv(t, filepath.Join(t.TempDir(), settings.PolicyFile))
+	folder := t.TempDir()
+	app := filepath.Join(folder, "app")
+	os.MkdirAll(app, 0o755)
+	os.WriteFile(filepath.Join(app, "main.go"), []byte("m1\n"), 0o644)
+	for _, args := range [][]string{{"init", "-q"}, {"add", "-A"}, {"commit", "-qm", "init"}} {
+		cmd := exec.Command(git, append([]string{"-C", app, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	head, _ := os.ReadFile(filepath.Join(app, ".git", "HEAD"))
+
+	turn := e.firstTurn(t, folder, "claude", "nested", true)
+	outcomeKept(t, e, turn.Turn)
+	ws := wsOfTurn(t, e, turn.Turn)
+	code, st := applyWS(t, e, token, ws, "{}")
+	if code != 200 || st.State != "applied" || len(st.Files) != 1 || st.Files[0] != "app/main.go" {
+		t.Fatalf("apply: %d %+v, want app/main.go applied", code, st)
+	}
+	if b, _ := os.ReadFile(filepath.Join(app, "main.go")); string(b) != "m2\n" {
+		t.Fatalf("app/main.go in the folder is %q after the apply, want the turn's edit", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(app, ".git", "HEAD")); string(b) != string(head) {
+		t.Fatalf("the apply changed the nested repo's .git/HEAD: %q", b)
 	}
 }
 

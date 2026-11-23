@@ -1,11 +1,13 @@
 package isolation
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -60,8 +62,8 @@ func TestShadowAgedFileRestores(t *testing.T) {
 }
 
 // A nested git repo in the copy never breaks a checkpoint: an unborn one (a
-// turn ran `git init` and did not commit) is skipped, a committed one is tracked
-// by its commit, and one a dropped turn added is removed by a restore.
+// turn ran `git init` and did not commit) is recorded by its files, and one a
+// dropped turn added is removed by a restore.
 func TestShadowNestedRepos(t *testing.T) {
 	git, err := exec.LookPath("git")
 	if err != nil {
@@ -105,6 +107,154 @@ func TestShadowNestedRepos(t *testing.T) {
 	}
 	if read(t, filepath.Join(s.Dir, "a.txt")) != "a2" {
 		t.Fatal("a.txt did not restore to t1")
+	}
+}
+
+// The files of a nested repo in the person's folder are the person's files: a
+// turn's edits inside one are in the changeset like any other, and a discard
+// restores them. A committed repo, a submodule (its .git a file) and a repo
+// a turn made with git init (a scaffolder such as cargo new) all count; the
+// nested repo's own .gitignore still holds, and its .git is never a change
+// nor touched by a restore. Before this, git recorded each as a commit pointer
+// (a gitlink) and the changeset dropped it, so an apply silently left out the
+// turn's work there (0.6.4).
+func TestShadowNestedRepoFilesAreChanges(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("no git on PATH")
+	}
+	run := func(dir string, args ...string) {
+		t.Helper()
+		args = append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t", "-c", "protocol.file.allow=always"}, args...)
+		if out, err := exec.Command(git, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	commitAll := func(dir string) {
+		t.Helper()
+		run(dir, "init", "-q")
+		run(dir, "add", "-A")
+		run(dir, "commit", "-qm", "init")
+	}
+	// A library another repo takes in as a submodule.
+	lib := t.TempDir()
+	fixture(t, lib, map[string]string{"lib.go": "l1"})
+	commitAll(lib)
+
+	// The person's folder: an outer repo with a submodule, and beside it a
+	// repo of its own whose .gitignore leaves out a log.
+	src := t.TempDir()
+	fixture(t, src, map[string]string{
+		"notes.txt":       "n1",
+		"app/main.go":     "m1",
+		"app/.gitignore":  "debug.log\n",
+		"app/debug.log":   "d1",
+		"app/pkg/util.go": "u1",
+	})
+	commitAll(filepath.Join(src, "app"))
+	run(src, "init", "-q")
+	run(src, "submodule", "add", "-q", lib, "vendor/lib")
+	run(src, "add", "-A")
+	run(src, "commit", "-qm", "init")
+
+	b, s := open(t, Copy, src)
+	fixture(t, s.Dir, map[string]string{
+		"notes.txt":          "n2",
+		"app/main.go":        "m2",
+		"app/pkg/new.go":     "new",
+		"app/debug.log":      "d2",
+		"vendor/lib/lib.go":  "l2",
+		"crate/Cargo.toml":   "c",
+		"crate/src/main.rs":  "fn main() {}",
+		"made/committed.txt": "c",
+		"deep/x/demo/a.rs":   "a",
+	})
+	run(filepath.Join(s.Dir, "crate"), "init", "-q")       // unborn: no commit yet
+	run(filepath.Join(s.Dir, "deep/x/demo"), "init", "-q") // unborn, below new folders
+	commitAll(filepath.Join(s.Dir, "made"))
+	if _, err := b.Checkpoint(s, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	cs := changeset(t, s, "t1")
+	for _, p := range []string{"notes.txt", "app/main.go", "app/pkg/new.go", "vendor/lib/lib.go",
+		"crate/Cargo.toml", "crate/src/main.rs", "made/committed.txt", "deep/x/demo/a.rs"} {
+		if !cs[p] {
+			t.Errorf("%s is not in the changeset: %v", p, cs)
+		}
+	}
+	for p := range cs {
+		if p == "app/debug.log" || p == "app" || p == "vendor/lib" || p == "crate" || p == "made" ||
+			strings.Contains(p, ".git/") || strings.HasSuffix(p, "/.git") {
+			t.Errorf("%s is in the changeset: %v", p, cs)
+		}
+	}
+
+	// A discard brings the nested repos' files back and leaves their .git.
+	if err := b.RestoreTo(s, Base); err != nil {
+		t.Fatal(err)
+	}
+	for p, want := range map[string]string{"app/main.go": "m1", "vendor/lib/lib.go": "l1", "app/pkg/new.go": "<missing>"} {
+		if got := read(t, filepath.Join(s.Dir, p)); got != want {
+			t.Errorf("after a discard %s is %q, want %q", p, got, want)
+		}
+	}
+	for _, p := range []string{"app/.git", "vendor/lib/.git"} {
+		if _, err := os.Lstat(filepath.Join(s.Dir, p)); err != nil {
+			t.Errorf("a discard removed %s: %v", p, err)
+		}
+	}
+
+	// The next turn's edit there is seen again. A repo whose files are all
+	// ignored has nothing to record and breaks nothing.
+	fixture(t, s.Dir, map[string]string{"app/main.go": "m3", "cache/.gitignore": "*\n", "cache/x.bin": "x"})
+	run(filepath.Join(s.Dir, "cache"), "init", "-q")
+	run(filepath.Join(s.Dir, "cache"), "commit", "-q", "--allow-empty", "-m", "init")
+	if _, err := b.Checkpoint(s, "t2"); err != nil {
+		t.Fatal(err)
+	}
+	if cs := changeset(t, s, "t2"); !cs["app/main.go"] || cs["cache/x.bin"] || cs["cache/.gitignore"] {
+		t.Errorf("t2 changeset: %v", cs)
+	}
+}
+
+// A copy opened by 0.6.4 recorded a nested repo by its commit (a gitlink) and
+// keeps doing so until it closes: a checkpoint under this version records no
+// file of the repo as added, and a discard to its Base, which holds only the
+// gitlink, leaves the repo's files in the copy rather than removing them.
+func TestShadowNestedRepoOldCopyKeepsGitlink(t *testing.T) {
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("no git on PATH")
+	}
+	src := t.TempDir()
+	fixture(t, src, map[string]string{"notes.txt": "n1", "app/main.go": "m1"})
+	for _, args := range [][]string{{"init", "-q"}, {"add", "-A"}, {"commit", "-qm", "init"}} {
+		args = append([]string{"-C", filepath.Join(src, "app"), "-c", "user.name=t", "-c", "user.email=t@t"}, args...)
+		if out, err := exec.Command(git, args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v %s", args, err, out)
+		}
+	}
+	b, s := open(t, Copy, src)
+	// Remake the private repo as 0.6.4 made it.
+	s.NestedFiles = false
+	if err := os.RemoveAll(s.gitShadowDir()); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.initShadow(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	fixture(t, s.Dir, map[string]string{"notes.txt": "n2", "app/main.go": "m2"})
+	if _, err := b.Checkpoint(s, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	if cs := changeset(t, s, "t1"); len(cs) != 1 || !cs["notes.txt"] {
+		t.Errorf("t1 changeset: %v, want notes.txt only", cs)
+	}
+	if err := b.RestoreTo(s, Base); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(s.Dir, "app/main.go")); got == "<missing>" {
+		t.Error("a discard removed app/main.go from an old copy")
 	}
 }
 

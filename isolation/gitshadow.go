@@ -220,21 +220,206 @@ func (s *Space) initShadow(ctx context.Context) error {
 	return err
 }
 
-// shadowAdd stages the whole work tree. git add aborts the lot on an unborn
-// nested repo (a turn ran `git init sub` and did not commit), so --ignore-
-// errors lets it add the rest; exit 1 is that partial add and is expected,
-// any other non-zero is a real failure. A committed nested repo is added as a
-// gitlink, its own files left to it; a reset leaves such a repo in place and a
-// clean removes one a dropped turn added (clean -ffd, below).
+// shadowAdd stages the whole work tree, the files of nested repos included.
+//
+// git add aborts the lot on an unborn nested repo (a turn ran `git init sub`
+// and did not commit), so --ignore-errors lets it add the rest; exit 1 is that
+// partial add and is expected, any other non-zero is a real failure.
+//
+// A folder holding a .git (a repo of the person's, a submodule, a project a
+// turn scaffolded) is the person's files all the same, but git add records a
+// committed one as a gitlink (its commit only) and skips an unborn one, so a
+// turn's edits inside it would never reach the changeset nor be undone by a
+// restore. Git has no switch for that. It decides only for a folder the index
+// knows nothing under, though: once one file below a nested repo is in the
+// index, add walks that folder as any other, with every ignore rule. So each
+// nested repo add left as a gitlink or untracked gets one such file (seedNested)
+// and add runs again, which also reaches the repos nested inside it. The
+// nested .git itself is never staged: git skips every path named .git, and a
+// restore's reset and clean leave it in place. So a discard puts back the
+// files of a nested repo but not its .git: after a turn that committed in it,
+// that repo in the copy shows the discarded commit's changes undone.
+//
+// A copy opened before this (NestedFiles false) keeps the one add.
 func (s *Space) shadowAdd(ctx context.Context) error {
+	if !s.NestedFiles {
+		_, err := s.addAll(ctx)
+		return err
+	}
+	tried := map[string]bool{}
+	for {
+		partial, err := s.addAll(ctx)
+		if err != nil {
+			return err
+		}
+		repos, err := s.nestedRepos(ctx, partial)
+		if err != nil {
+			return err
+		}
+		again := false
+		for _, dir := range repos {
+			if tried[dir] {
+				continue // nothing in it could be staged: it stays a gitlink
+			}
+			tried[dir] = true
+			touched, err := s.seedNested(ctx, dir)
+			if err != nil {
+				return err
+			}
+			again = again || touched
+		}
+		if !again {
+			return nil
+		}
+	}
+}
+
+// addAll is one `git add -A` over the work tree (see shadowAdd). partial is
+// git's exit 1: something could not be staged, such as an unborn nested repo.
+func (s *Space) addAll(ctx context.Context) (partial bool, err error) {
 	_, _, code, err := s.runGit(ctx, "add", "-A", "--ignore-errors")
 	if err == nil || code == 1 {
-		return nil
+		return code == 1, nil
 	}
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return false, ctx.Err()
 	}
-	return errGit
+	return false, errGit
+}
+
+// nestedRepos are the folders, relative to the copy and slash-separated, that
+// the last add left as nested repos: a gitlink in the index (a committed repo
+// or a submodule), and, after a partial add, an untracked folder holding a
+// .git (an unborn repo, which is what makes the add partial).
+func (s *Space) nestedRepos(ctx context.Context, partial bool) ([]string, error) {
+	var dirs []string
+	staged, err := s.shadowGit(ctx, "ls-files", "-s", "-z")
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range strings.Split(string(staged), "\x00") {
+		if mode, p, ok := parseLsEntry(entry); ok && mode == "160000" {
+			dirs = append(dirs, p)
+		}
+	}
+	if !partial {
+		return dirs, nil
+	}
+	// What is still untracked and not ignored is what add could not stage:
+	// an unborn repo is listed as its own folder, at any depth (with
+	// --directory git would name only the topmost new folder above it).
+	others, err := s.shadowGit(ctx, "ls-files", "-o", "-z", "--exclude-standard")
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range strings.Split(string(others), "\x00") {
+		dir := strings.TrimSuffix(p, "/")
+		if dir == p || dir == "" {
+			continue // a file, not a folder
+		}
+		if _, err := os.Lstat(filepath.Join(s.Dir, filepath.FromSlash(dir), ".git")); err == nil {
+			dirs = append(dirs, dir)
+		}
+	}
+	return dirs, nil
+}
+
+// seedNested stages the first file below the nested repo dir that the copy's
+// ignore rules keep, in place of its gitlink, so the next add walks dir as a
+// plain folder (shadowAdd), and says whether it changed the index. A dir with
+// no such file (everything in it ignored) is left as it is: there is nothing
+// to record. A seed git cannot stage (unreadable) only drops the gitlink,
+// which the next add puts back, as it skips that file anyway.
+func (s *Space) seedNested(ctx context.Context, dir string) (bool, error) {
+	seed, err := s.firstKeptFile(ctx, dir)
+	if err != nil || seed == "" {
+		return false, err
+	}
+	if _, err := s.shadowGit(ctx, "update-index", "--force-remove", "--", dir); err != nil {
+		return false, err
+	}
+	if _, err := s.shadowGit(ctx, "update-index", "--add", "--", seed); err != nil && ctx.Err() != nil {
+		return false, ctx.Err()
+	}
+	return true, nil
+}
+
+// firstKeptFile is the first regular file or symbolic link below dir,
+// breadth first, that the copy's ignore rules do not leave out, or "" when
+// there is none. A folder that is ignored is not entered, nor is any entry
+// named .git.
+func (s *Space) firstKeptFile(ctx context.Context, dir string) (string, error) {
+	queue := []string{dir}
+	for len(queue) > 0 {
+		d := queue[0]
+		queue = queue[1:]
+		entries, err := os.ReadDir(filepath.Join(s.Dir, filepath.FromSlash(d)))
+		if err != nil {
+			continue // unreadable: add skips it too
+		}
+		var paths []string
+		for _, e := range entries {
+			if e.Name() != ".git" {
+				paths = append(paths, d+"/"+e.Name())
+			}
+		}
+		ignored, err := s.ignored(ctx, paths)
+		if err != nil {
+			return "", err
+		}
+		for _, e := range entries {
+			p := d + "/" + e.Name()
+			switch {
+			case e.Name() == ".git" || ignored[p]:
+			case e.IsDir():
+				queue = append(queue, p)
+			case e.Type().IsRegular() || e.Type()&fs.ModeSymlink != 0:
+				return p, nil
+			}
+		}
+	}
+	return "", nil
+}
+
+// ignored is which of paths the copy's ignore rules (the built-in ones and the
+// folder's own .gitignore files) leave out. check-ignore takes no literal
+// pathspecs, so it runs without GIT_LITERAL_PATHSPECS, and each path goes in
+// as "./" and the path: pathspec magic is read only at a path's start, so a
+// name such as ":(top)x" is still that name. It exits 0 when it printed an
+// ignored path and 1 when none is.
+func (s *Space) ignored(ctx context.Context, paths []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(paths) == 0 {
+		return out, nil
+	}
+	var in strings.Builder
+	for _, p := range paths {
+		in.WriteString("./" + p + "\x00")
+	}
+	cmd := exec.CommandContext(ctx, "git", append(s.gitBaseArgs(), "check-ignore", "-z", "--stdin", "--no-index")...)
+	cmd.Dir = s.Dir
+	for _, kv := range sealedGitEnv() {
+		if !strings.HasPrefix(kv, "GIT_LITERAL_PATHSPECS=") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Stdin = strings.NewReader(in.String())
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	err := cmd.Run()
+	var ee *exec.ExitError
+	switch {
+	case ctx.Err() != nil:
+		return nil, ctx.Err()
+	case err != nil && !(errors.As(err, &ee) && ee.ExitCode() == 1):
+		return nil, errGit
+	}
+	for _, p := range strings.Split(stdout.String(), "\x00") {
+		if p != "" {
+			out[strings.TrimPrefix(p, "./")] = true
+		}
+	}
+	return out, nil
 }
 
 // commitShadow records the copy's current files as the checkpoint name's
@@ -462,7 +647,9 @@ func (s *Space) shadowDiffRaw(ctx context.Context, from, to string) ([]shadowCha
 }
 
 // errGitlink: a nested repo's commit pointer (git mode 160000), which is not a
-// file to apply. Its own files belong to it, not the changeset.
+// file to apply. shadowAdd records a nested repo by its files; a gitlink is
+// left for one with nothing it could stage (every file ignored or unreadable),
+// and in every checkpoint of a copy opened before that (NestedFiles false).
 var errGitlink = errors.New("isolation: a nested repo is tracked by its commit only")
 
 // shadowFileSide builds the workspace file for one side of a changed path, by

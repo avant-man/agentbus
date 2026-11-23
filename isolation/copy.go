@@ -71,6 +71,7 @@ func (copyBackend) Open(r Request) (*Space, error) {
 	// first commit (Base) is the copy as opened. space.json is written only
 	// after the repo and its Base are made, so a copy with a record always has
 	// a working shadow, and a crash before then is remade from scratch.
+	s.NestedFiles = true
 	if err := s.initShadow(ctxOf(r)); err != nil {
 		copyBackend{}.Close(s)
 		return nil, err

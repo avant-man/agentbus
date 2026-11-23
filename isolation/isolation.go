@@ -159,6 +159,13 @@ type Space struct {
 	// a working shadow. A copy built from a snapshot, or one made before this,
 	// has none: it keeps checkpoints the Merkle way and cannot be reset.
 	Shadow bool `json:"shadow,omitempty"`
+	// NestedFiles, with Shadow: the private repo records a nested git repo
+	// in the copy (a repo of the person's, a submodule, one a turn made) by
+	// its files, as any folder (shadowAdd). compat 0.6.4: a copy opened then
+	// recorded such a repo by its commit only and keeps doing so until it
+	// closes, so no history mixes the two and a discard never restores to a
+	// checkpoint that holds the repo's commit in place of its files.
+	NestedFiles bool `json:"nested_files,omitempty"`
 	// Fallback: why the backend asked for could not be used, and which one
 	// was, as For's choice fell back. Empty when it was used.
 	Fallback string `json:"fallback,omitempty"`
